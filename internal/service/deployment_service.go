@@ -35,34 +35,26 @@ func (s *deploymentService) DeployApp(ctx context.Context, req models.Deployment
 		req.Replicas = 1
 	}
 
-	// deployment algorithm: Todo/ partially done
-	var targetClouds []string
-	switch req.Strategy {
-	case "cost-optimized":
-		targetClouds = []string{"ocs"}
-	case "high-availability":
-		targetClouds = []string{"aws", "ocs"}
-	case "custom":
-		if req.CustomCloud != "" {
-			targetClouds = []string{req.CustomCloud}
-		} else {
-			return nil, fmt.Errorf("custom_cloud must be specified when strategy is custom")
-		}
-	default:
-		targetClouds = []string{"ocs"}
+	// available clouds and their cost tiers
+	// TODO: store and fetch this dynamically from db
+	availableClouds := []models.CloudProfile{
+		{Name: "hetzner", CostTier: 1}, // Cheap
+		{Name: "aws", CostTier: 3},     // Expensive
 	}
+
+	strategy := GetStrategy(req.Strategy)
+	deploymentPlan := strategy.GeneratePlan(req, availableClouds)
 
 	// execute deployments and collect endpoints
 	deploymentResults := make(map[string]string)
 
-	for _, cloudName := range targetClouds {
+	for cloudName, tailoredReq := range deploymentPlan {
 		kubeconfig, err := s.clusterRepo.GetKubeconfigByName(cloudName)
 		if err != nil {
 			return nil, fmt.Errorf("failed to retrieve credentials for %s: %v", cloudName, err)
 		}
 
-		// push to k8s cluster and wait for the loadBalancer IP
-		publicEndpoint, err := s.k8sDeployer.PushDeployment(ctx, kubeconfig, req)
+		publicEndpoint, err := s.k8sDeployer.PushDeployment(ctx, kubeconfig, tailoredReq)
 		if err != nil {
 			return nil, fmt.Errorf("deployment to %s failed: %v", cloudName, err)
 		}
