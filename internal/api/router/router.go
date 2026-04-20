@@ -7,7 +7,10 @@ import (
 )
 
 // SetupRouter initializes the HTTP multiplexer and registers all API endpoints
-func SetupRouter(deployController *controllers.DeploymentController) *http.ServeMux {
+func SetupRouter(
+	deployController *controllers.DeploymentController,
+	clusterController *controllers.ClusterController,
+) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	// for PaaS load balancers
@@ -32,6 +35,19 @@ func SetupRouter(deployController *controllers.DeploymentController) *http.Serve
 		}
 
 		deployController.HandleDeploy(w, r)
+	})
+
+	mux.HandleFunc("/api/clusters", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		clusterController.HandleAddCluster(w, r)
 	})
 
 	return mux

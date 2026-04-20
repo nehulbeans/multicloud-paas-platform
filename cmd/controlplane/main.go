@@ -63,13 +63,19 @@ func main() {
 	}
 	log.Println("Connected to PostgreSQL database.")
 
+	// repos
 	clusterRepo := repository.NewClusterRepository(db)
 	k8sDeployer := k8sclient.NewK8sDeployer()
 
+	// services
+	clusterService := service.NewClusterService(clusterRepo)
 	deployService := service.NewDeploymentService(clusterRepo, k8sDeployer)
+
+	// controllers
+	clusterController := controllers.NewClusterController(clusterService)
 	deployController := controllers.NewDeploymentController(deployService)
 
-	mux := router.SetupRouter(deployController)
+	mux := router.SetupRouter(deployController, clusterController)
 
 	log.Println("Server listening on port 8080")
 	if err := http.ListenAndServe(":8080", mux); err != nil {

@@ -13,9 +13,3 @@ type DeploymentRequest struct {
 	Size        string `json:"size"`                   // "micro" (512MB), "small" (1GB), "large" (4GB)
 	Replicas    int32  `json:"replicas"`
 }
-
-type Cluster struct {
-	ID         string
-	Name       string
-	Kubeconfig string // encrypted
-}
