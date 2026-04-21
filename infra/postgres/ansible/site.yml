@@ -1,0 +1,11 @@
+- name: Configure PostgreSQL primary
+  hosts: postgres_primary
+  become: yes
+  roles:
+    - postgres_primary
+
+- name: Configure PostgreSQL replica
+  hosts: postgres_replica
+  become: yes
+  roles:
+    - postgres_replica
