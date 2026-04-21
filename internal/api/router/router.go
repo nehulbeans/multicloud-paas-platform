@@ -37,7 +37,7 @@ func SetupRouter(
 		deployController.HandleDeploy(w, r)
 	})
 
-	mux.HandleFunc("/api/clusters", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/internal/api/clusters", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")

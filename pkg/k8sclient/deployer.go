@@ -3,10 +3,12 @@ package k8sclient
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
@@ -16,7 +18,7 @@ import (
 )
 
 type K8sDeployer interface {
-	PushDeployment(ctx context.Context, kubeconfig string, req models.DeploymentRequest) (string, error)
+	PushDeployment(ctx context.Context, kubeconfig string, req models.DeploymentRequest, customHost string) (string, error)
 }
 
 type k8sDeployer struct{}
@@ -25,7 +27,8 @@ func NewK8sDeployer() K8sDeployer {
 	return &k8sDeployer{}
 }
 
-func (k *k8sDeployer) PushDeployment(ctx context.Context, kubeconfig string, req models.DeploymentRequest) (string, error) {
+func (k *k8sDeployer) PushDeployment(ctx context.Context, kubeconfig string, req models.DeploymentRequest, customHost string) (string, error) {
+	// Initialize the Kubernetes client (using your existing helper method)
 	config, err := clientcmd.RESTConfigFromKubeConfig([]byte(kubeconfig))
 	if err != nil {
 		return "", fmt.Errorf("failed to parse kubeconfig: %v", err)
@@ -33,22 +36,150 @@ func (k *k8sDeployer) PushDeployment(ctx context.Context, kubeconfig string, req
 
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		return "", fmt.Errorf("failed to create k8s client: %v", err)
+		return "", fmt.Errorf("failed to create k8s clientset: %v", err)
+	}
+	replicas := int32(req.Replicas)
+
+	// ==========================================
+	// 1. CREATE DEPLOYMENT
+	// ==========================================
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      req.AppName,
+			Namespace: "default",
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": req.AppName},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"app": req.AppName},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  req.AppName,
+							Image: req.Image,
+							Ports: []corev1.ContainerPort{
+								{
+									ContainerPort: 80, // Assuming standard web apps listen on 80
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 
-	// Create Deployment
-	if err := k.createDeployment(ctx, clientset, req); err != nil {
-		return "", err
+	_, err = clientset.AppsV1().Deployments("default").Create(ctx, deployment, metav1.CreateOptions{})
+	if err != nil && !strings.Contains(err.Error(), "already exists") {
+		return "", fmt.Errorf("failed to create deployment: %v", err)
 	}
 
-	// Create Service
-	if err := k.createService(ctx, clientset, req); err != nil {
-		return "", err
+	// ==========================================
+	// 2. CREATE SERVICE (ClusterIP instead of NodePort)
+	// ==========================================
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      req.AppName + "-service",
+			Namespace: "default",
+		},
+		Spec: corev1.ServiceSpec{
+			Type: corev1.ServiceTypeClusterIP, // Keeps traffic inside the cluster!
+			Selector: map[string]string{
+				"app": req.AppName, // Must match the Deployment labels
+			},
+			Ports: []corev1.ServicePort{
+				{
+					Port:       80,                 // Port exposed to Traefik
+					TargetPort: intstr.FromInt(80), // Port exposed by your container
+				},
+			},
+		},
 	}
 
-	// poll for the LoadBalancer IP
-	serviceName := req.AppName + "-svc"
-	return k.waitForLoadBalancerIP(ctx, clientset, serviceName)
+	_, err = clientset.CoreV1().Services("default").Create(ctx, service, metav1.CreateOptions{})
+	if err != nil && !strings.Contains(err.Error(), "already exists") {
+		return "", fmt.Errorf("failed to create service: %v", err)
+	}
+
+	// ==========================================
+	// 3. CREATE INGRESS (Traefik Routing)
+	// ==========================================
+	pathType := networkingv1.PathTypePrefix
+	ingress := &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      req.AppName + "-ingress",
+			Namespace: "default",
+			Annotations: map[string]string{
+				// Tell K3s to use its built-in Traefik router
+				"kubernetes.io/ingress.class": "traefik",
+			},
+		},
+		Spec: networkingv1.IngressSpec{
+			Rules: []networkingv1.IngressRule{
+				{
+					Host: customHost, // This is the dynamic URL from service.go!
+					IngressRuleValue: networkingv1.IngressRuleValue{
+						HTTP: &networkingv1.HTTPIngressRuleValue{
+							Paths: []networkingv1.HTTPIngressPath{
+								{
+									Path:     "/",
+									PathType: &pathType,
+									Backend: networkingv1.IngressBackend{
+										Service: &networkingv1.IngressServiceBackend{
+											Name: req.AppName + "-service", // Matches Service above
+											Port: networkingv1.ServiceBackendPort{
+												Number: 80, // Matches Service port above
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, err = clientset.NetworkingV1().Ingresses("default").Create(ctx, ingress, metav1.CreateOptions{})
+	if err != nil && !strings.Contains(err.Error(), "already exists") {
+		return "", fmt.Errorf("failed to create ingress: %v", err)
+	}
+
+	// ==========================================
+	// 4. FETCH AND RETURN THE NODE IP
+	// ==========================================
+	// Retrieve the IP address of the first node in the cluster
+	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil || len(nodes.Items) == 0 {
+		return "", fmt.Errorf("failed to get cluster nodes to extract IP: %v", err)
+	}
+
+	var nodeIP string
+	// Try to get ExternalIP first (if configured)
+	for _, addr := range nodes.Items[0].Status.Addresses {
+		if addr.Type == corev1.NodeExternalIP {
+			nodeIP = addr.Address
+			break
+		}
+	}
+	// Fallback to InternalIP if no ExternalIP is found
+	if nodeIP == "" {
+		for _, addr := range nodes.Items[0].Status.Addresses {
+			if addr.Type == corev1.NodeInternalIP {
+				nodeIP = addr.Address
+				break
+			}
+		}
+	}
+
+	// Return just the clean IP (e.g., "80.225.211.127"). No ports!
+	return nodeIP, nil
 }
 
 func (k *k8sDeployer) createDeployment(ctx context.Context, clientset *kubernetes.Clientset, req models.DeploymentRequest) error {
@@ -106,7 +237,6 @@ func (k *k8sDeployer) createDeployment(ctx context.Context, clientset *kubernete
 func (k *k8sDeployer) createService(ctx context.Context, clientset *kubernetes.Clientset, req models.DeploymentRequest) error {
 	labels := map[string]string{"app": req.AppName}
 
-	// Map the first requested port to external port 80. Fallback to 8080 if none provided.
 	targetPort := int32(8080)
 	if len(req.Ports) > 0 {
 		targetPort = req.Ports[0]
@@ -118,7 +248,7 @@ func (k *k8sDeployer) createService(ctx context.Context, clientset *kubernetes.C
 		},
 		Spec: corev1.ServiceSpec{
 			Selector: labels,
-			Type:     corev1.ServiceTypeLoadBalancer,
+			Type:     corev1.ServiceTypeNodePort,
 			Ports: []corev1.ServicePort{
 				{
 					Port:       80,
@@ -129,10 +259,7 @@ func (k *k8sDeployer) createService(ctx context.Context, clientset *kubernetes.C
 	}
 
 	_, err := clientset.CoreV1().Services("default").Create(ctx, service, metav1.CreateOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to create k8s service: %v", err)
-	}
-	return nil
+	return err
 }
 
 func (k *k8sDeployer) waitForLoadBalancerIP(ctx context.Context, clientset *kubernetes.Clientset, serviceName string) (string, error) {

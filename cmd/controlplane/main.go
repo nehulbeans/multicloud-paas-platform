@@ -14,6 +14,7 @@ import (
 	"multicloud-paas-platform/internal/api/router"
 	"multicloud-paas-platform/internal/repository"
 	"multicloud-paas-platform/internal/service"
+	"multicloud-paas-platform/pkg/dnsclient"
 	"multicloud-paas-platform/pkg/k8sclient"
 )
 
@@ -63,13 +64,17 @@ func main() {
 	}
 	log.Println("Connected to PostgreSQL database.")
 
+	cfToken := os.Getenv("CLOUDFLARE_API_TOKEN")
+	cfZoneID := os.Getenv("CLOUDFLARE_ZONE_ID")
+	dnsClient := dnsclient.NewCloudflareClient(cfToken, cfZoneID)
+
 	// repos
 	clusterRepo := repository.NewClusterRepository(db)
 	k8sDeployer := k8sclient.NewK8sDeployer()
 
 	// services
 	clusterService := service.NewClusterService(clusterRepo)
-	deployService := service.NewDeploymentService(clusterRepo, k8sDeployer)
+	deployService := service.NewDeploymentService(clusterRepo, k8sDeployer, dnsClient)
 
 	// controllers
 	clusterController := controllers.NewClusterController(clusterService)
