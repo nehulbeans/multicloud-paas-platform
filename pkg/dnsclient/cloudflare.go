@@ -7,10 +7,9 @@ import (
 	"net/http"
 )
 
-// handles interactions with the Cloudflare DNS API
 type CloudflareClient struct {
 	APIToken string
-	ZoneID   string // the id of root domain
+	ZoneID   string
 	BaseURL  string
 }
 
@@ -22,44 +21,32 @@ func NewCloudflareClient(token, zoneID string) *CloudflareClient {
 	}
 }
 
-// Internal Structs for parsing Cloudflare JSON responses
-type cfResponse struct {
-	Success bool       `json:"success"`
-	Result  []cfRecord `json:"result"`
-}
-
-type cfRecord struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	Content string `json:"content"`
-}
-
-func (c *CloudflareClient) UpsertRecord(subdomain, ipAddress string) error {
-	// Full domain name (app-name.domain.com)
-	// For the MVP, we assume the subdomain string passed already includes the root domain
-
-	// check if the record already exists
+// MapToTunnel creates or updates a CNAME record pointing to a specific Cloudflare Tunnel.
+func (c *CloudflareClient) MapToTunnel(subdomain string, tunnelUUID string) error {
 	recordID, err := c.getRecordID(subdomain)
 	if err != nil {
 		return err
 	}
 
+	// The target must be the Cloudflare Tunnel URL format
+	target := fmt.Sprintf("%s.cfargotunnel.com", tunnelUUID)
+
 	payload := map[string]interface{}{
-		"type":    "A",
+		"type":    "CNAME",
 		"name":    subdomain,
-		"content": ipAddress,
-		"ttl":     60,    // 60 seconds is the minimum TTL, crucial for fast failover
-		"proxied": false, // TODO: setup tls on server and cloudflare both ends
+		"content": target,
+		"ttl":     60,   // 60s allows for fast failover switches
+		"proxied": true, // Must be proxied for Cloudflare tunnels to work securely
 	}
 
 	body, _ := json.Marshal(payload)
 
 	var req *http.Request
 	if recordID != "" {
-		// Record exists: Send PUT request to update it
+		// Update existing record
 		req, _ = http.NewRequest("PUT", fmt.Sprintf("%s/%s", c.BaseURL, recordID), bytes.NewBuffer(body))
 	} else {
-		// Record does not exist: Send POST request to create it
+		// Create new record
 		req, _ = http.NewRequest("POST", c.BaseURL, bytes.NewBuffer(body))
 	}
 
@@ -80,10 +67,9 @@ func (c *CloudflareClient) UpsertRecord(subdomain, ipAddress string) error {
 	return nil
 }
 
-// queries Cloudflare to find an existing DNS record by name
+// getRecordID finds an existing CNAME record by name
 func (c *CloudflareClient) getRecordID(subdomain string) (string, error) {
-	// Query param to filter by name
-	url := fmt.Sprintf("%s?name=%s&type=A", c.BaseURL, subdomain)
+	url := fmt.Sprintf("%s?name=%s&type=CNAME", c.BaseURL, subdomain)
 
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Add("Authorization", "Bearer "+c.APIToken)
@@ -96,16 +82,20 @@ func (c *CloudflareClient) getRecordID(subdomain string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	var cfResp cfResponse
+	var cfResp struct {
+		Success bool `json:"success"`
+		Result  []struct {
+			ID string `json:"id"`
+		} `json:"result"`
+	}
+
 	if err := json.NewDecoder(resp.Body).Decode(&cfResp); err != nil {
 		return "", err
 	}
 
-	// If a record is found, return its ID
 	if cfResp.Success && len(cfResp.Result) > 0 {
 		return cfResp.Result[0].ID, nil
 	}
 
-	// Return empty string if no record exists
 	return "", nil
 }
