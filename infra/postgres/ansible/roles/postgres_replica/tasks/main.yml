@@ -1,0 +1,39 @@
+- name: Install PostgreSQL 16 packages
+  package:
+    name:
+      - postgresql-16
+      - postgresql-client-16
+    state: present
+
+- name: Stop PostgreSQL service
+  service:
+    name: postgresql
+    state: stopped
+
+- name: Remove old replica data directory
+  file:
+    path: /var/lib/postgresql/16/main
+    state: absent
+
+- name: Recreate replica data directory
+  file:
+    path: /var/lib/postgresql/16/main
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0700"
+
+- name: Run pg_basebackup from primary
+  become_user: postgres
+  environment:
+    PGPASSWORD: "{{ postgres_replication_password }}"
+  shell: |
+    pg_basebackup -h {{ postgres_primary_ip }} -U {{ postgres_replication_user }} -D /var/lib/postgresql/16/main -P -R
+  args:
+    creates: /var/lib/postgresql/16/main/standby.signal
+
+- name: Start PostgreSQL replica
+  service:
+    name: postgresql
+    state: started
+    enabled: true

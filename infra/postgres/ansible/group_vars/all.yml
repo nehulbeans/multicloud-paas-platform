@@ -1,0 +1,8 @@
+postgres_version: 16
+postgres_port: 5432
+postgres_replication_user: repuser
+postgres_replication_password: 
+postgres_data_dir_primary: /var/lib/pgsql/16/data
+postgres_data_dir_replica: /var/lib/postgresql/16/main
+postgres_primary_ip: 100.102.176.15
+postgres_replica_ip: 
