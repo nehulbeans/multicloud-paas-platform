@@ -1,8 +1,10 @@
 package repository
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
+	"multicloud-paas-platform/internal/core/models"
 	"multicloud-paas-platform/pkg/crypto"
 )
 
@@ -10,6 +12,7 @@ import (
 type ClusterRepository interface {
 	AddCluster(name string, encryptedKubeconfig string) error
 	GetKubeconfigByName(cloudName string) (string, error)
+	GetCloudByID(ctx context.Context, id string) (*models.Cloud, error) // NEW
 }
 
 type clusterRepo struct {
@@ -52,4 +55,26 @@ func (r *clusterRepo) GetKubeconfigByName(cloudName string) (string, error) {
 	}
 
 	return decryptedKubeconfig, nil
+}
+
+func (r *clusterRepo) GetCloudByID(ctx context.Context, id string) (*models.Cloud, error) {
+	var cloud models.Cloud
+	query := `SELECT id, name, tunnel_uuid, status, created_at FROM clouds WHERE id = $1`
+
+	err := r.db.QueryRowContext(ctx, query, id).Scan(
+		&cloud.ID,
+		&cloud.Name,
+		&cloud.TunnelUUID,
+		&cloud.Status,
+		&cloud.CreatedAt,
+	)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("cloud with ID '%s' not found", id)
+		}
+		return nil, fmt.Errorf("database error: %v", err)
+	}
+
+	return &cloud, nil
 }

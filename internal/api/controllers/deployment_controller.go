@@ -40,9 +40,9 @@ func (c *DeploymentController) HandleDeploy(w http.ResponseWriter, r *http.Reque
 	w.WriteHeader(http.StatusCreated)
 
 	response := map[string]interface{}{
-		"status":    "success",
-		"message":   "Deployment completed successfully",
-		"endpoints": results,
+		"status":  "success",
+		"message": "Deployment completed and routed successfully",
+		"details": results,
 	}
 
 	json.NewEncoder(w).Encode(response)

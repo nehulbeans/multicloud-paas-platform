@@ -6,6 +6,8 @@ import (
 	"os"
 	"strings"
 
+	"github.com/google/uuid"
+
 	"multicloud-paas-platform/internal/core/models"
 	"multicloud-paas-platform/internal/repository"
 	"multicloud-paas-platform/pkg/dnsclient"
@@ -13,117 +15,137 @@ import (
 )
 
 type DeploymentService interface {
-	DeployApp(ctx context.Context, req models.DeploymentRequest) (map[string]string, error)
+	DeployApp(ctx context.Context, req models.DeploymentRequest) (map[string]interface{}, error)
 }
 
 type deploymentService struct {
-	clusterRepo repository.ClusterRepository
-	k8sDeployer k8sclient.K8sDeployer
-	dnsClient   *dnsclient.CloudflareClient
+	clusterRepo    repository.ClusterRepository
+	deploymentRepo repository.DeploymentRepository
+	k8sDeployer    k8sclient.K8sDeployer
+	dnsClient      *dnsclient.CloudflareClient
 }
 
-// NewDeploymentService injects the Database, Kubernetes, and DNS clients
 func NewDeploymentService(
-	repo repository.ClusterRepository,
+	cluster_repo repository.ClusterRepository,
+	deployment_repo repository.DeploymentRepository,
 	deployer k8sclient.K8sDeployer,
 	dns *dnsclient.CloudflareClient,
 ) DeploymentService {
 	return &deploymentService{
-		clusterRepo: repo,
-		k8sDeployer: deployer,
-		dnsClient:   dns,
+		clusterRepo:    cluster_repo,
+		deploymentRepo: deployment_repo,
+		k8sDeployer:    deployer,
+		dnsClient:      dns,
 	}
 }
 
-// this orchestrates the multi-cloud deployment and configures global DNS
-func (s *deploymentService) DeployApp(ctx context.Context, req models.DeploymentRequest) (map[string]string, error) {
+func (s *deploymentService) DeployApp(ctx context.Context, req models.DeploymentRequest) (map[string]interface{}, error) {
 	if req.AppName == "" || req.Image == "" {
 		return nil, fmt.Errorf("app_name and image are required fields")
 	}
 
-	// default at least 1 replica
 	if req.Replicas == 0 {
 		req.Replicas = 1
 	}
 
-	// Step 1: Generate the custom URL FIRST
-	// We must do this before deploying so we can tell the Kubernetes Ingress what domain to listen for
-	rootDomain := os.Getenv("ROOT_DOMAIN") // e.g., "leancrust.dpdns.org"
+	// 1. Generate the custom URL
+	rootDomain := os.Getenv("ROOT_DOMAIN")
 	if rootDomain == "" {
-		rootDomain = "local.dev" // Fallback for local testing
+		rootDomain = "local.dev"
 	}
 	customURL := fmt.Sprintf("%s.%s", req.AppName, rootDomain)
 
-	// available clouds and their cost tiers
-	// TODO: store and fetch this dynamically from db
-	availableClouds := []models.CloudProfile{
-		{Name: "oracle", CostTier: 1}, // Cheap
-	}
+	var targetClouds []models.Cloud
 
-	// gets the algorithmic strategy and generate the plan
-	strategy := GetStrategy(req.Strategy)
-	deploymentPlan := strategy.GeneratePlan(req, availableClouds)
-
-	// execute deployments and collect endpoints
-	deploymentResults := make(map[string]string)
-
-	for cloudName, tailoredReq := range deploymentPlan {
-		kubeconfig, err := s.clusterRepo.GetKubeconfigByName(cloudName)
-		if err != nil {
-			return nil, fmt.Errorf("failed to retrieve credentials for %s: %v", cloudName, err)
+	// 2. Determine target clouds based on strategy
+	if req.Strategy == "custom" {
+		if len(req.CustomClouds) == 0 {
+			return nil, fmt.Errorf("the custom_clouds array must contain at least one cloud ID")
 		}
 
-		// Step 2: Push the tailored k8s objects AND pass the customURL to create the Ingress
-		publicEndpoint, err := s.k8sDeployer.PushDeployment(ctx, kubeconfig, tailoredReq, customURL)
+		// Double-check the requested clouds exist in our DB and fetch their Tunnel UUIDs
+		for _, cloudID := range req.CustomClouds {
+			cloud, err := s.clusterRepo.GetCloudByID(ctx, cloudID)
+			if err != nil {
+				fmt.Printf("Warning: Cloud %s not found or offline, skipping. %v\n", cloudID, err)
+				continue
+			}
+			targetClouds = append(targetClouds, *cloud)
+		}
+	}
+
+	if len(targetClouds) == 0 {
+		return nil, fmt.Errorf("none of the requested clouds are currently available")
+	}
+
+	primaryCloud := targetClouds[0] // Priority 1
+
+	// 3. Create the Deployment Record in the DB
+	deploymentID := uuid.New().String()
+	deploymentRecord := models.Deployment{
+		ID:             deploymentID,
+		AppName:        req.AppName,
+		Subdomain:      customURL,
+		Strategy:       req.Strategy,
+		CurrentCloudID: primaryCloud.ID,
+	}
+
+	if err := s.deploymentRepo.CreateDeployment(ctx, deploymentRecord); err != nil {
+		return nil, fmt.Errorf("failed to save deployment record: %v", err)
+	}
+
+	// 4. Deploy to ALL targeted clouds in the background
+	for i, cloud := range targetClouds {
+		priority := i + 1 // 1 = Primary, 2 = Secondary...
+
+		// Fetch the decrypted Kubeconfig from the clusters table based on the cloud's Name
+		kubeconfig, err := s.clusterRepo.GetKubeconfigByName(cloud.Name)
 		if err != nil {
-			return nil, fmt.Errorf("deployment to %s failed: %v", cloudName, err)
+			fmt.Printf("Warning: Failed to retrieve kubeconfig for %s: %v\n", cloud.Name, err)
+			s.deploymentRepo.AddDeploymentCloudMapping(ctx, models.DeploymentCloud{
+				DeploymentID: deploymentID,
+				CloudID:      cloud.ID,
+				Priority:     priority,
+				AppStatus:    "failed",
+			})
+			continue
 		}
 
-		deploymentResults[cloudName] = publicEndpoint
+		// Push K8s manifests using the dynamically fetched Kubeconfig
+		_, err = s.k8sDeployer.PushDeployment(ctx, kubeconfig, req, customURL)
+
+		status := "running"
+		if err != nil {
+			fmt.Printf("Warning: Failed to deploy to %s: %v\n", cloud.Name, err)
+			status = "failed"
+		}
+
+		// Map this specific cloud to the deployment in the DB
+		s.deploymentRepo.AddDeploymentCloudMapping(ctx, models.DeploymentCloud{
+			DeploymentID: deploymentID,
+			CloudID:      cloud.ID,
+			Priority:     priority,
+			AppStatus:    status,
+		})
 	}
 
-	// Step 3: DNS ROUTING - map the custom domain to the primary active cloud IP
-	_, err := s.configureGlobalDNS(customURL, req.Strategy, deploymentResults)
-	if err != nil {
-		// we log the error but don't fail the deployment since the K8s pods are running
-		fmt.Printf("Warning: DNS update failed: %v\n", err)
+	// 5. DNS ROUTING - Point Cloudflare exactly to the Primary Cloud's Tunnel UUID
+	if !strings.HasSuffix(customURL, "local.dev") {
+		// MapToTunnel will use the CNAME record approach bypassing private IP limitations
+		err := s.dnsClient.MapToTunnel(customURL, primaryCloud.TunnelUUID)
+		if err != nil {
+			fmt.Printf("Warning: DNS CNAME update failed: %v\n", err)
+		} else {
+			fmt.Printf("Successfully routed %s -> %s.cfargotunnel.com\n", customURL, primaryCloud.TunnelUUID)
+		}
 	}
 
-	// add the custom URL to the results so the frontend can display a clickable link to the user
-	deploymentResults["custom_url"] = customURL
-
-	return deploymentResults, nil
-}
-
-// configureGlobalDNS assigns the application a custom URL and maps it to the active cloud IP
-func (s *deploymentService) configureGlobalDNS(customURL string, strategy string, deploymentResults map[string]string) (string, error) {
-	// Skip Cloudflare API call if running locally
-	if strings.HasSuffix(customURL, "local.dev") {
-		return customURL, nil
-	}
-
-	// Determine the Primary IP to point the DNS to
-	var primaryIP string
-	primaryIP = deploymentResults["oracle"]
-
-	if strings.HasPrefix(primaryIP, "192.168.") {
-		fmt.Printf("Skipping DNS update: %s is behind a Cloudflare Tunnel\n", primaryIP)
-		return customURL, nil
-	}
-
-	if primaryIP == "" {
-		return customURL, fmt.Errorf("primary IP is empty, cannot update DNS")
-	}
-
-	// Strip the port to satisfy Cloudflare API rules
-	cleanIP := strings.Split(primaryIP, ":")[0]
-
-	// Send the Upsert request to Cloudflare
-	err := s.dnsClient.UpsertRecord(customURL, cleanIP)
-	if err != nil {
-		return customURL, fmt.Errorf("failed to map %s to %s: %v", customURL, cleanIP, err)
-	}
-
-	fmt.Printf("Successfully mapped %s to %s\n", customURL, cleanIP)
-	return customURL, nil
+	// 6. Return a clean, single response to the user
+	return map[string]interface{}{
+		"app_name":      req.AppName,
+		"custom_url":    fmt.Sprintf("https://%s", customURL),
+		"primary_cloud": primaryCloud.Name,
+		"strategy":      req.Strategy,
+		"status":        "deployed",
+	}, nil
 }

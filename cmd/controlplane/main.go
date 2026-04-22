@@ -70,11 +70,12 @@ func main() {
 
 	// repos
 	clusterRepo := repository.NewClusterRepository(db)
+	deploymentRepo := repository.NewDeploymentRepository(db)
 	k8sDeployer := k8sclient.NewK8sDeployer()
 
 	// services
 	clusterService := service.NewClusterService(clusterRepo)
-	deployService := service.NewDeploymentService(clusterRepo, k8sDeployer, dnsClient)
+	deployService := service.NewDeploymentService(clusterRepo, deploymentRepo, k8sDeployer, dnsClient)
 
 	// controllers
 	clusterController := controllers.NewClusterController(clusterService)
