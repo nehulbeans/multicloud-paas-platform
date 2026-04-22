@@ -17,6 +17,7 @@ type DeploymentRepository interface {
 	UpdateCurrentCloud(ctx context.Context, deploymentID, newCloudID string) error
 	UpdateAppStatus(ctx context.Context, deploymentID, cloudID, status string) error
 	GetNextHealthyCloud(ctx context.Context, deploymentID string) (*models.Cloud, error)
+	GetAllActiveDeployments(ctx context.Context) ([]models.Deployment, error)
 }
 
 type deploymentRepository struct {
@@ -102,4 +103,48 @@ func (r *deploymentRepository) GetNextHealthyCloud(ctx context.Context, deployme
 	}
 
 	return &cloud, nil
+}
+
+// GetAllActiveDeployments fetches all deployments that aren't completely dead yet
+func (r *deploymentRepository) GetAllActiveDeployments(ctx context.Context) ([]models.Deployment, error) {
+	// We only want deployments that have at least one cloud still marked as 'running' or 'deploying'.
+	// If all clouds for an app are marked 'failed', we stop checking it to save worker CPU.
+	query := `
+		SELECT DISTINCT d.id, d.app_name, d.subdomain, d.strategy, d.current_cloud_id, d.created_at
+		FROM deployments d
+		JOIN deployment_clouds dc ON d.id = dc.deployment_id
+		WHERE dc.app_status IN ('running', 'deploying')
+	`
+
+	rows, err := r.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query active deployments: %v", err)
+	}
+	defer rows.Close()
+
+	var activeDeployments []models.Deployment
+
+	for rows.Next() {
+		var dep models.Deployment
+		err := rows.Scan(
+			&dep.ID,
+			&dep.AppName,
+			&dep.Subdomain,
+			&dep.Strategy,
+			&dep.CurrentCloudID,
+			&dep.CreatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan deployment row: %v", err)
+		}
+
+		activeDeployments = append(activeDeployments, dep)
+	}
+
+	// Catch any errors that occurred during the iteration
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating deployment rows: %v", err)
+	}
+
+	return activeDeployments, nil
 }

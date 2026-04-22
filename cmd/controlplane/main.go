@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -14,6 +15,7 @@ import (
 	"multicloud-paas-platform/internal/api/router"
 	"multicloud-paas-platform/internal/repository"
 	"multicloud-paas-platform/internal/service"
+	"multicloud-paas-platform/internal/worker"
 	"multicloud-paas-platform/pkg/dnsclient"
 	"multicloud-paas-platform/pkg/k8sclient"
 )
@@ -82,6 +84,10 @@ func main() {
 	deployController := controllers.NewDeploymentController(deployService)
 
 	mux := router.SetupRouter(deployController, clusterController)
+
+	// Health Check Worker
+	healthWorker := worker.NewHealthCheckWorker(deploymentRepo, dnsClient)
+	go healthWorker.Start(context.Background())
 
 	log.Println("Server listening on port 8080")
 	if err := http.ListenAndServe(":8080", mux); err != nil {
