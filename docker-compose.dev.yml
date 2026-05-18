@@ -1,0 +1,12 @@
+services:
+  paas-controlplane:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # Override the DB_HOST in the container to point to localhost
+      - DB_HOST=host.docker.internal
